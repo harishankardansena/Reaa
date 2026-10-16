@@ -7,6 +7,36 @@ import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { cliTest } from "../../support/cli/cliFixture.js";
 import type { TestProcesses } from "../../support/process/processFixture.js";
 
+cliTest(
+  "drains a large structured validation error before exiting through a pipe",
+  async ({ cli }) => {
+    // Exceed the pipe capacity even on hosts with large stdout buffers. No
+    // target is opened: each symbol fails argument validation first.
+    const count = 2_048;
+    const result = await cli.run({
+      arguments: [
+        "demangle-swift",
+        "missing",
+        ...Array.from({ length: count }, () => "bad\nsymbol"),
+        "--json",
+      ],
+      timeoutMs: 20_000,
+    });
+    expect(result).toMatchObject({
+      exitCode: 1,
+      signal: null,
+      stderr: "",
+      json: {
+        code: "VALIDATION_ERROR",
+        fieldErrors: expect.arrayContaining([
+          expect.objectContaining({ path: `symbols.${count - 1}` }),
+        ]),
+      },
+    });
+  },
+  30_000,
+);
+
 /** Run the CLI, closing its stdout reader after `bytes` (0: before any write). */
 const runWithClosedReader = async (
   processes: TestProcesses,
@@ -43,6 +73,10 @@ describe.skipIf(process.platform === "win32")(
       ["toon", ["capabilities", "--format", "toon"]],
       ["json", ["capabilities", "--format", "json"]],
       ["mcp doctor", ["mcp", "doctor", "--json"]],
+      [
+        "validation error",
+        ["inspect-keyed-archive", "missing", "--limit", "0", "--json"],
+      ],
     ] as const)(
       "stops quietly with the SIGPIPE status when the reader closes first ($0)",
       async ([, arguments_], { processes }) => {
