@@ -106,3 +106,47 @@ it("keeps sibling literals when a later data property replaces the setter", () =
     ]),
   });
 });
+
+it("keeps array element members unknown after a write through an element setter", () => {
+  expect(
+    returned(`
+      export function observe() {
+        const state = { list: [{ value: 1, set update(next) { this.value = next; } }] };
+        state.list[0].update = 2;
+        return state.list[0];
+      }
+    `),
+  ).toMatchObject({ status: "unknown" });
+});
+
+it("keeps direct array element members unknown after a write through an element setter", () => {
+  expect(
+    returned(`
+      export function observe() {
+        const arr = [{ value: 1, set update(next) { this.value = next; } }];
+        arr[0].update = 2;
+        return arr[0];
+      }
+    `),
+  ).toMatchObject({ status: "unknown" });
+});
+
+it("keeps sibling literals when array element property written is an ordinary data property", () => {
+  expect(
+    returned(`
+      export function observe() {
+        const state = { list: [{ value: 1, update: 0 }] };
+        state.list[0].update = 2;
+        return state.list[0];
+      }
+    `),
+  ).toMatchObject({
+    status: "object",
+    properties: expect.arrayContaining([
+      expect.objectContaining({
+        name: "value",
+        value: { status: "literal", value: 1 },
+      }),
+    ]),
+  });
+});

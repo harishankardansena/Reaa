@@ -109,17 +109,42 @@ const localSetterReceiver = (
     if (projection.length !== 0) continue;
     let object: t.Node | undefined = unwrapJavaScriptExpression(node).node;
     for (const segment of receiver) {
-      if (!t.isObjectExpression(object)) break;
-      const member: t.ObjectExpression["properties"][number] | undefined =
-        object.properties.findLast(
-          (property) =>
-            t.isObjectProperty(property) &&
-            semanticStaticPropertyKey(property.key, property.computed) ===
-              segment,
-        );
-      object = t.isObjectProperty(member)
-        ? unwrapJavaScriptExpression(member.value).node
-        : undefined;
+      if (t.isObjectExpression(object)) {
+        const member: t.ObjectExpression["properties"][number] | undefined =
+          object.properties.findLast(
+            (property) =>
+              t.isObjectProperty(property) &&
+              semanticStaticPropertyKey(property.key, property.computed) ===
+                segment,
+          );
+        object = t.isObjectProperty(member)
+          ? unwrapJavaScriptExpression(member.value).node
+          : undefined;
+      } else if (t.isArrayExpression(object)) {
+        const index = semanticArrayIndex(segment);
+        if (index === null || index >= object.elements.length) {
+          object = undefined;
+          break;
+        }
+        if (
+          object.elements
+            .slice(0, index + 1)
+            .some((element) => element !== null && t.isSpreadElement(element))
+        ) {
+          object = undefined;
+          break;
+        }
+        const element = object.elements[index];
+        object =
+          element !== null &&
+          element !== undefined &&
+          !t.isSpreadElement(element)
+            ? unwrapJavaScriptExpression(element).node
+            : undefined;
+      } else {
+        object = undefined;
+        break;
+      }
     }
     if (!t.isObjectExpression(object)) continue;
     const keys = setterKeys(object);
