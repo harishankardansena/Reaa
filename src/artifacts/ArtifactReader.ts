@@ -33,6 +33,14 @@ export interface ArtifactEntry {
   readonly unpacked: boolean;
   readonly limitations: readonly string[];
   readonly adapterKey: string;
+  /**
+   * The name exactly as the container stores it, when it differs from `path`:
+   * for a ZIP member, the raw central-directory name (e.g. `./classes.dex`, or
+   * the name an Info-ZIP Unicode Path extra field replaces in `path`). Runtimes
+   * that look members up by stored name (the JDK, ART) must match on this, not
+   * on `path`.
+   */
+  readonly storedPath?: string;
   /** Filesystem identity captured during traversal, when supplied by an adapter. */
   readonly sourceIdentity?: {
     readonly device: bigint;
@@ -88,6 +96,7 @@ export const sameArtifactEntry = (
   entry.declaredSha256 === produced.declaredSha256 &&
   entry.unpacked === produced.unpacked &&
   entry.adapterKey === produced.adapterKey &&
+  entry.storedPath === produced.storedPath &&
   entry.limitations.length === produced.limitations.length &&
   entry.limitations.every(
     (limitation, index) => limitation === produced.limitations[index],
@@ -120,6 +129,13 @@ export interface ArtifactReaderTraversal {
 /** Per-iterator observation sink; adapters report intentional omissions without shared state. */
 export interface ArtifactTraversalOptions {
   readonly onOmission?: (omission: ArtifactTraversalOmission) => void;
+  /**
+   * Entries the caller may later `open()`. A reader that keeps per-entry state
+   * for opening (a ZIP keeps each decoded central-directory record) retains it
+   * only for these, so enumerating a huge archive costs memory proportional to
+   * what the caller selects. Omitted: every entry stays openable.
+   */
+  readonly retain?: (entry: ArtifactEntry) => boolean;
 }
 
 /** Read-only adapter over one directory, archive, or virtual container. */

@@ -32,8 +32,10 @@ import {
   sameArtifactEntry,
   type ArtifactEntry,
   type ArtifactReader,
+  type ArtifactTraversalOptions,
 } from "./ArtifactReader.js";
 import type { ZipPackageFormat } from "../domain/zipPackageFormat.js";
+import { normalizeArchiveMemberPath } from "../domain/archiveMemberPath.js";
 import {
   ARTIFACT_DECOMPRESSION_RATIO,
   artifactDecompressionBudgetBytes,
@@ -141,6 +143,7 @@ class NodeFileReader extends Reader<string> {
       throw new ArtifactReaderFailure(
         "limit",
         `ZIP metadata read requires ${readBytes} bytes, exceeding the ${this.maximumReadBytes}-byte read budget`,
+        { boundary: "memory" },
       );
     const bytes = Buffer.alloc(readBytes);
     const read = await handle.read(bytes, 0, bytes.length, index);
@@ -179,7 +182,8 @@ export class ZipArtifactReader implements ArtifactReader {
       checkSignature: true,
       checkOverlappingEntry: true,
       // Unflagged names use the ZIP legacy encoding (CP437); the UTF-8 flag
-      // and validated Unicode Path extra fields remain authoritative.
+      // remains authoritative, and a validated Unicode Path extra field names
+      // the logical path while `storedPath` keeps the raw central-directory name.
       filenameEncoding: "cp437",
       // REA applies its own provider-neutral path validation in scanReader and
       // must preserve that typed failure instead of zip.js rejecting first.
@@ -187,7 +191,10 @@ export class ZipArtifactReader implements ArtifactReader {
     });
   }
 
-  async *entries(signal?: AbortSignal): AsyncIterable<ArtifactEntry> {
+  async *entries(
+    signal?: AbortSignal,
+    options?: ArtifactTraversalOptions,
+  ): AsyncIterable<ArtifactEntry> {
     let index = 0;
     // A traversal owns its accounting, including overlapping or repeated passes.
     let declaredFileBytes = 0;
@@ -213,6 +220,7 @@ export class ZipArtifactReader implements ArtifactReader {
           throw new ArtifactReaderFailure(
             "limit",
             `ZIP entries declare ${String(declaredFileBytes)} uncompressed bytes, exceeding this archive's ${String(budget)}-byte decompression budget (${String(MINIMUM_ARTIFACT_DECOMPRESSION_BYTES)}-byte minimum, ${String(ARTIFACT_DECOMPRESSION_RATIO)}x archive size); a small archive cannot expand this far`,
+            { boundary: "capacity" },
           );
       }
       const stored = this.#entries.get(metadata.adapterKey);
@@ -221,7 +229,9 @@ export class ZipArtifactReader implements ArtifactReader {
           "integrity",
           `ZIP member identity changed during enumeration: ${entry.filename}`,
         );
-      if (stored === undefined)
+      // A decoded record costs ~8 KB; keep it only for entries the caller may
+      // open (unretained entries cannot be opened from this reader).
+      if (stored === undefined && (options?.retain?.(metadata) ?? true))
         this.#entries.set(metadata.adapterKey, {
           source: entry,
           metadata: copyArtifactEntry(metadata),
@@ -241,7 +251,9 @@ export class ZipArtifactReader implements ArtifactReader {
         ),
       );
     const source = stored.source;
-    if (source.directory || isSymlink(source))
+    // zip.js types attribute-marked directories without `getData`, but attaches
+    // it to every member; the projected kind decides what is a regular file.
+    if (stored.metadata.kind !== "file" || !("getData" in source))
       return Promise.reject(
         new ArtifactReaderFailure("format", "ZIP entry is not a regular file"),
       );
@@ -270,13 +282,26 @@ const projectZipEntry = (
   entry: Entry,
   index: number,
 ): ArtifactEntry | undefined => {
+  const storedName = zipStoredName(entry);
+  const sourcePath = zipEntryPath(entry, storedName);
+  // Only a trailing "/" on the raw stored central-directory name makes a ZIP
+  // member a directory, as for the JDK's ZipEntry.isDirectory, Python's
+  // zipfile and ART's libziparchive, none of which read the Info-ZIP Unicode
+  // Path field; a Unicode Path name cannot turn a stored file into a directory
+  // or a stored directory into a file. Unix-mode or MS-DOS directory
+  // attributes on any other name are reported, and the member stays readable.
+  // Because such a member is a file, inventory validation then fails closed
+  // where a file cannot stand: an attribute-only directory `foo` beside a
+  // child `foo/bar` is a prefix conflict, and one named `.` or the empty name
+  // is a path that is not normalized.
+  const directoryName = storedName.endsWith("/");
+  const attributeDirectory = !directoryName && hasDirectoryAttributes(entry);
   const kind = isSymlink(entry)
     ? "symlink"
-    : entry.directory
+    : directoryName
       ? "directory"
       : "file";
-  const sourcePath = zipEntryPath(entry);
-  const path = sourcePath.replace(/^(?:\.\/)+/u, "");
+  const path = normalizeArchiveMemberPath(sourcePath);
   // Root directory markers carry no inventory occurrence. A file with this
   // spelling is still passed to the shared path validator and rejected there.
   if (kind === "directory" && (path === "" || path === ".")) return undefined;
@@ -292,6 +317,16 @@ const projectZipEntry = (
     unpacked: false,
     limitations: [
       ...(kind === "symlink" ? ["Archive symlink target was not read."] : []),
+      ...(kind === "file" && attributeDirectory
+        ? [
+            `ZIP member ${JSON.stringify(storedName)} has directory external attributes (0x${(entry.externalFileAttributes >>> 0).toString(16).padStart(8, "0")}) but no trailing "/" in its stored name; it is read as a regular file, as the JDK and Python's zipfile read it.`,
+          ]
+        : []),
+      ...(sourcePath === storedName
+        ? []
+        : [
+            `ZIP member stored name ${JSON.stringify(storedName)} differs from its Info-ZIP Unicode Path extra field name ${JSON.stringify(sourcePath)}; the logical path uses the Unicode Path name, while lookups by stored name (e.g. the JDK or ART) see ${JSON.stringify(storedName)}.`,
+          ]),
       ...(path === sourcePath
         ? []
         : [
@@ -299,6 +334,7 @@ const projectZipEntry = (
           ]),
     ],
     adapterKey: `zip-entry:${index}`,
+    ...(path === storedName ? {} : { storedPath: storedName }),
   };
 };
 
@@ -330,9 +366,21 @@ const decodeCp437 = (bytes: Uint8Array): string =>
       : CP437_HIGH_HALF.charAt(byte - 0x80),
   ).join("");
 
-const zipEntryPath = (entry: Entry): string => {
+/**
+ * The central-directory name exactly as stored, decoded by the same rule as an
+ * unextended name: UTF-8 when the language-encoding flag is set, else CP437.
+ * zip.js replaces `filename` with a valid Unicode Path extra field name, so the
+ * stored name is decoded from `rawFilename` here.
+ */
+const zipStoredName = (entry: Entry): string =>
+  entry.bitFlag?.languageEncodingFlag === true
+    ? decodeStrictZipUtf8(entry.rawFilename, "ZIP filename is not valid UTF-8")
+    : decodeCp437(entry.rawFilename);
+
+/** The logical name: a valid Info-ZIP Unicode Path field, else the stored name. */
+const zipEntryPath = (entry: Entry, storedName: string): string => {
   const field = entry.extraFieldUnicodePath;
-  if (field?.valid !== true) return entry.filename;
+  if (field?.valid !== true) return storedName;
   return decodeStrictZipUtf8(
     field.data.subarray(5),
     "ZIP Unicode Path extra field is not valid UTF-8",
@@ -358,7 +406,9 @@ const extractStream = (entry: FileEntry, signal?: AbortSignal): Readable => {
     // against `getData` rejecting with its own AbortError. That ordering is what
     // keeps the caller-visible failure typed as `cancelled`.
     output.destroy(
-      new ArtifactReaderFailure("cancelled", "ZIP operation cancelled"),
+      new ArtifactReaderFailure("cancelled", "ZIP operation cancelled", {
+        cause: signal?.reason,
+      }),
     );
   };
   signal?.addEventListener("abort", onAbort, { once: true });
@@ -444,12 +494,23 @@ async function* typedZipFailures<T>(
   }
 }
 
+/**
+ * Directory external attributes, as zip.js reads them, without zip.js's
+ * `directory` flag, which also counts a trailing "/" on the Unicode Path name.
+ */
+const hasDirectoryAttributes = (entry: Entry): boolean =>
+  ((entry.unixMode ?? 0) & 0o170000) === 0o040000 ||
+  ((entry.unixExternalUpper ?? 0) & 0o170000) === 0o040000 ||
+  (entry.msDosCompatible && entry.msdosAttributes?.directory === true);
+
 const isSymlink = (entry: Entry): boolean =>
   entry.unixMode !== undefined && (entry.unixMode & 0o170000) === 0o120000;
 
 const abortIfNeeded = (signal?: AbortSignal): void => {
   if (signal?.aborted === true)
-    throw new ArtifactReaderFailure("cancelled", "ZIP operation cancelled");
+    throw new ArtifactReaderFailure("cancelled", "ZIP operation cancelled", {
+      cause: signal.reason,
+    });
 };
 
 const toError = (cause: unknown): Error =>

@@ -227,6 +227,7 @@ const pathRequests: readonly [string, Record<string, unknown>][] = [
     { path: "/tmp/sample.wasm", candidate_paths: [nul] },
   ],
   ["inspect_evm_interface", { path: nul, encoding: "raw" }],
+  ["inspect_dex_debug_metadata", { path: nul }],
   [
     "export_web_scripts",
     { capture_path: "/tmp/capture.json", output_directory: nul },
