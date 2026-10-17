@@ -711,6 +711,7 @@ it("projects package details from dumpsys package output", async () => {
     shellStub({
       "dumpsys:package": `Packages:
   Package [com.example] (abcdef):
+    pkg=Package{abcdef com.example}
     userId=10234
     versionName=1.2.3
     versionCode=45 minSdk=24 targetSdk=34
@@ -740,6 +741,31 @@ it("projects package details from dumpsys package output", async () => {
   });
 });
 
+it("keeps the permission count unknown when the parsed package is unavailable", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:package": `Packages:
+  Package [com.example] (abcdef):
+    appId=10234
+    pkg=null
+    codePath=/data/app/com.example
+    versionCode=45
+    pkgFlags=[ HAS_CODE ]
+    User 0: installed=true
+`,
+    }),
+  );
+  const result = await evidenceResult(providerOver(binary), {
+    operation: "inspect_adb_package",
+    input: { serial: "emulator-5554", package: "com.example" },
+  });
+  expect(result).toMatchObject({
+    version_code: "45",
+    requested_permissions_count: null,
+    coverage: "partial",
+  });
+});
+
 // PackageInfo.getLongVersionCode() combines versionCodeMajor and versionCode
 // into a signed 64-bit long, which JSON numbers cannot hold exactly.
 it.each(["9007199254740993", "-4294967296"])(
@@ -749,6 +775,7 @@ it.each(["9007199254740993", "-4294967296"])(
       shellStub({
         "dumpsys:package": `Packages:
   Package [com.example] (abcdef):
+    pkg=Package{abcdef com.example}
     versionCode=${versionCode} minSdk=24 targetSdk=34
 `,
       }),
@@ -759,6 +786,7 @@ it.each(["9007199254740993", "-4294967296"])(
     });
     expect(result).toMatchObject({
       version_code: versionCode,
+      requested_permissions_count: 0,
       coverage: "complete",
     });
   },
