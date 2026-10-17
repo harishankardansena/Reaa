@@ -1303,6 +1303,15 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
       "unusedFallback",
       "nestedSnapshot",
       "declaratorSnapshot",
+      "conditionalSnapshot",
+      "alternateSnapshot",
+      "orSnapshot",
+      "andSnapshot",
+      "nullishSnapshot",
+      "leftOrSnapshot",
+      "leftAndSnapshot",
+      "leftNullishSnapshot",
+      "conditionalAlias",
     ];
     const sources = [
       `export default function make() {
@@ -1320,7 +1329,16 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
         const {value: destructured} = source;
         const objectSnapshot = {value: source.value};
         const arraySnapshot = [source.value];
+        const conditionalSnapshot = true ? source.value : "unused";
+        const alternateSnapshot = false ? "unused" : source.value;
+        const orSnapshot = false || source.value;
+        const andSnapshot = true && source.value;
+        const nullishSnapshot = null ?? source.value;
+        const leftOrSnapshot = source.value || "unused";
+        const leftAndSnapshot = source.value && source.value;
+        const leftNullishSnapshot = source.value ?? "unused";
         mutate(source);
+        const conditionalAlias = true ? conditionalSnapshot : "unused";
         const fallback = {value: "TOKEN"};
         const container = {child: {}};
         const {child: selected = fallback} = container;
@@ -1337,6 +1355,8 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
           snapshot, destructured,
           objectSnapshot: objectSnapshot.value, arraySnapshot: arraySnapshot[0],
           unusedFallback: fallback.value, nestedSnapshot, declaratorSnapshot,
+          conditionalSnapshot, alternateSnapshot, orSnapshot, andSnapshot, nullishSnapshot,
+          leftOrSnapshot, leftAndSnapshot, leftNullishSnapshot, conditionalAlias,
         };
       }`,
       `export default function make() { return ${JSON.stringify({
@@ -1352,15 +1372,9 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
     );
     // Execute the authored fixtures independently of static analysis.
     for (const [index, value] of ["TOKEN", "UPDATED"].entries()) {
-      const { stdout } = await execute(process.execPath, [
-        "--input-type=module",
-        "--eval",
-        "const module = await import(process.argv[1]); console.log(JSON.stringify(module.default()));",
-        // ESM import() takes a URL specifier; a Windows drive path parses as a
-        // `c:` URL scheme and is rejected.
-        pathToFileURL(join(root, String(index), "parser.mjs")).href,
-      ]);
-      expect(JSON.parse(stdout)).toEqual({
+      expect(
+        await runtimeDefaultExport(join(root, String(index), "parser.mjs")),
+      ).toEqual({
         kind: "capture-boundary",
         ...Object.fromEntries(fields.map((field) => [field, value])),
       });
@@ -1397,6 +1411,208 @@ describe("application workflow CLI and MCP capture lifetimes", () => {
     expect(await compareThroughStdioMcp(input)).toMatchObject(expected);
   }, 20_000);
 });
+
+describe("application workflow CLI and MCP constant branches", () => {
+  it("compares known primitive branches with inlined values through CLI and MCP", async () => {
+    const root = await createTestTempDirectory("rea-known-branches-cli-");
+    const sources = [
+      `const isDev = false;
+       const port = 8080;
+       export default function config() {
+         return {
+           type: "config",
+           mode: isDev ? "development" : "production",
+           port: port || 3000,
+           verbose: isDev && "yes",
+           fallback: null ?? "default",
+         };
+       }`,
+      `export default function config() {
+         return { type: "config", mode: "production", port: 8080,
+           verbose: false, fallback: "default" };
+       }`,
+    ];
+    const roots = await writeComparisonSources(root, sources);
+    const [left, right] = await Promise.all(
+      roots.map((applicationRoot) =>
+        runCli(["analyze-javascript-application", applicationRoot, "--json"]),
+      ),
+    );
+    for (const applicationRoot of roots) {
+      expect(
+        await runtimeDefaultExport(join(applicationRoot, "parser.mjs")),
+      ).toEqual({
+        type: "config",
+        mode: "production",
+        port: 8080,
+        verbose: false,
+        fallback: "default",
+      });
+    }
+    const input = {
+      left,
+      right,
+      left_module_path: "parser.mjs",
+      left_export_name: "default",
+      right_module_path: "parser.mjs",
+      right_export_name: "default",
+    };
+    const expected = {
+      normalized_result: {
+        summary: { added: 0, removed: 0, changed: 0, unknown: 0 },
+        changes: [],
+        coverage: { status: "complete-within-inputs", paired_variants: 1 },
+      },
+    };
+    expect(
+      await runCliWithRequestFile(
+        root,
+        "compare-javascript-export-shapes",
+        input,
+      ),
+    ).toMatchObject(expected);
+    expect(await compareThroughStdioMcp(input)).toMatchObject(expected);
+  }, 20_000);
+
+  it("preserves uncertainty for selectors read before var initialization through CLI and MCP", async () => {
+    const root = await createTestTempDirectory("rea-selector-read-cli-");
+    const roots = await writeComparisonSources(root, [
+      `export default function config() {
+        const alias = enabled;
+        const mode = alias ? "on" : "off";
+        const port = preferred || 3000;
+        const fallback = enabled ?? "default";
+        var enabled = true;
+        var preferred = 8080;
+        return { type: "config", mode, port, fallback };
+      }`,
+      `export default () => ({ type: "config", mode: "on", port: 8080, fallback: true });`,
+    ]);
+    expect(await runtimeDefaultExport(join(roots[0]!, "parser.mjs"))).toEqual({
+      type: "config",
+      mode: "off",
+      port: 3000,
+      fallback: "default",
+    });
+    expect(await runtimeDefaultExport(join(roots[1]!, "parser.mjs"))).toEqual({
+      type: "config",
+      mode: "on",
+      port: 8080,
+      fallback: true,
+    });
+    const [left, right] = await Promise.all(
+      roots.map((path) =>
+        runCli(["analyze-javascript-application", path, "--json"]),
+      ),
+    );
+    const input = {
+      left,
+      right,
+      left_module_path: "parser.mjs",
+      left_export_name: "default",
+      right_module_path: "parser.mjs",
+      right_export_name: "default",
+    };
+    const expected = {
+      normalized_result: {
+        summary: { added: 0, removed: 0, changed: 1, unknown: 2 },
+        changes: expect.arrayContaining([
+          expect.objectContaining({
+            path: "/mode",
+            status: "changed",
+            left: { availability: "union", values: ["off", "on"] },
+          }),
+          ...["/port", "/fallback"].map((path) =>
+            expect.objectContaining({
+              path,
+              status: "unknown",
+              left: expect.objectContaining({ availability: "unknown" }),
+            }),
+          ),
+        ]),
+      },
+    };
+    expect(
+      await runCliWithRequestFile(
+        root,
+        "compare-javascript-export-shapes",
+        input,
+      ),
+    ).toMatchObject(expected);
+    expect(await compareThroughStdioMcp(input)).toMatchObject(expected);
+  }, 20_000);
+});
+
+it("keeps selected operands and unordered lexical writes uncertain through CLI and MCP", async () => {
+  const root = await createTestTempDirectory("rea-branch-operands-cli-");
+  const roots = await writeComparisonSources(root, [
+    `export default function config() {
+      let enabled;
+      const lexical = enabled ? "on" : "off";
+      0, enabled = true;
+      const conditional = true ? later : "off";
+      const orValue = false || later;
+      const andValue = true && later;
+      const nullish = null ?? later;
+      var later = "on";
+      return { type: "source-read", lexical, conditional, orValue, andValue, nullish };
+    }`,
+    `export default () => ({ type: "source-read", lexical: "on",
+      conditional: "on", orValue: "on", andValue: "on", nullish: "on" });`,
+  ]);
+  expect(await runtimeDefaultExport(join(roots[0]!, "parser.mjs"))).toEqual({
+    type: "source-read",
+    lexical: "off",
+  });
+  expect(await runtimeDefaultExport(join(roots[1]!, "parser.mjs"))).toEqual({
+    type: "source-read",
+    lexical: "on",
+    conditional: "on",
+    orValue: "on",
+    andValue: "on",
+    nullish: "on",
+  });
+  const [left, right] = await Promise.all(
+    roots.map((path) =>
+      runCli(["analyze-javascript-application", path, "--json"]),
+    ),
+  );
+  const input = {
+    left,
+    right,
+    left_module_path: "parser.mjs",
+    left_export_name: "default",
+    right_module_path: "parser.mjs",
+    right_export_name: "default",
+  };
+  const expected = {
+    normalized_result: {
+      summary: { added: 0, removed: 0, changed: 1, unknown: 4 },
+      changes: expect.arrayContaining([
+        expect.objectContaining({
+          path: "/lexical",
+          status: "changed",
+          left: { availability: "union", values: ["off", "on"] },
+        }),
+        ...["/conditional", "/orValue", "/andValue", "/nullish"].map((path) =>
+          expect.objectContaining({
+            path,
+            status: "unknown",
+            left: expect.objectContaining({ availability: "unknown" }),
+          }),
+        ),
+      ]),
+    },
+  };
+  expect(
+    await runCliWithRequestFile(
+      root,
+      "compare-javascript-export-shapes",
+      input,
+    ),
+  ).toMatchObject(expected);
+  expect(await compareThroughStdioMcp(input)).toMatchObject(expected);
+}, 20_000);
 
 describe("application workflow CLI export Evidence", () => {
   it("preserves uncertainty after a helper can mutate an awaited return object", async () => {
@@ -1724,6 +1940,17 @@ it("retains bundled isolated-world contextBridge APIs through dedicated and gene
     );
   }
 });
+
+const runtimeDefaultExport = async (path: string): Promise<unknown> => {
+  const { stdout } = await execute(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    "const module = await import(process.argv[1]); console.log(JSON.stringify(module.default()));",
+    // ESM specifiers encode drive letters and literal path characters such as #.
+    pathToFileURL(path).href,
+  ]);
+  return JSON.parse(stdout);
+};
 
 const runCli = async (
   arguments_: readonly string[],

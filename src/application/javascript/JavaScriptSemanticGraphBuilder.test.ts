@@ -1,4 +1,7 @@
-import { primitiveByteExpansionSource } from "../../../tests/fixtures/javascriptPrimitiveExpansion.js";
+import {
+  primitiveByteExpansionSource,
+  primitiveCandidateExpansionExpression,
+} from "../../../tests/fixtures/javascriptPrimitiveExpansion.js";
 import { graphForJavaScript as graphFor } from "../../../tests/fixtures/javascriptSemanticGraph.js";
 import * as t from "@babel/types";
 import { expect, it } from "vitest";
@@ -169,8 +172,7 @@ it("keeps dynamic calls explicit and returns complete deterministic results", ()
 });
 
 it("preserves primitive candidate budget unknowns in semantic graph coverage", () => {
-  const term = '(true ? "a" : "b")';
-  const source = `const answer = ${Array.from({ length: 20 }, () => term).join(" + ")};`;
+  const source = `const answer = ${primitiveCandidateExpansionExpression()};`;
   const ir = analyzeJavaScriptSemantics(source);
   const graph = graphFor(source, ir);
 
@@ -187,6 +189,22 @@ it("preserves primitive candidate budget unknowns in semantic graph coverage", (
       detail: expect.stringMatching(/primitive candidate budget exceeded/i),
     }),
   ]);
+});
+
+it("keeps folded known choices complete through semantic graph projection", () => {
+  const source = `const answer = ${primitiveCandidateExpansionExpression("true")};`;
+  const ir = analyzeJavaScriptSemantics(source);
+  const graph = graphFor(source, ir);
+
+  expect(ir.bindings.find(({ name }) => name === "answer")?.value).toEqual({
+    status: "literal",
+    value: "a".repeat(20),
+  });
+  expect(ir.coverage.status).toBe("complete");
+  expect(semanticCoverageResourceLimits(ir.coverage)).toEqual([]);
+  expect(
+    graph.unknowns.filter(({ reason }) => reason === "resource-limit"),
+  ).toEqual([]);
 });
 
 it("preserves derived string-byte limit reasons in semantic graph unknowns", () => {
@@ -206,8 +224,7 @@ it("preserves derived string-byte limit reasons in semantic graph unknowns", () 
 });
 
 it("retains resource-limit reasons at nested object property slots", () => {
-  const term = '(true ? "a" : "b")';
-  const source = `const answer = { nested: { value: ${Array.from({ length: 20 }, () => term).join(" + ")} } };`;
+  const source = `const answer = { nested: { value: ${primitiveCandidateExpansionExpression()} } };`;
   const ir = analyzeJavaScriptSemantics(source);
   const graph = graphFor(source, ir);
 

@@ -1,11 +1,12 @@
+/** Unknown choices exceed candidate storage; a known selector stays foldable. */
+export const primitiveCandidateExpansionExpression = (
+  condition = "choice",
+): string =>
+  Array.from({ length: 20 }, () => `(${condition} ? "a" : "b")`).join(" + ");
+
 /** Source whose concatenated alternatives exceed primitive candidate storage. */
-export const primitiveCandidateExpansionSource = (): string => {
-  const expression = Array.from(
-    { length: 20 },
-    () => '(true ? "a" : "b")',
-  ).join(" + ");
-  return `const answer = { nested: ${expression} };`;
-};
+export const primitiveCandidateExpansionSource = (): string =>
+  `const answer = { nested: ${primitiveCandidateExpansionExpression()} };`;
 
 /** Source whose repeated doubling exceeds derived primitive string storage. */
 export const primitiveByteExpansionSource = (): string => {

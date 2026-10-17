@@ -65,11 +65,12 @@ interface MemoizedEvaluation<T> {
 
 interface ReadSnapshotValue extends MemoizedEvaluation<JavaScriptSemanticValue> {
   readonly depthDependent: boolean;
+  readonly captureIndependent: boolean;
 }
 
 type ReadSnapshotValues = WeakMap<
   JavaScriptSemanticBindingState["initializers"][number],
-  Map<string, Map<number, ReadSnapshotValue>>
+  Map<string, Map<boolean, Map<number, ReadSnapshotValue>>>
 >;
 
 /** Read/provenance memos live for one query; whole values follow state effects. */
@@ -108,6 +109,8 @@ interface EvaluationContext {
   readonly bindings: Map<string, number>;
   readonly expressionDepth: number;
   readonly capturePoint?: t.Node;
+  /** Check initializer order throughout a branch operand's value. */
+  readonly sourceRead?: true;
   readonly primitiveBindingValues: Map<string, JavaScriptSemanticValue>;
   readonly dependence: EvaluationDependence;
   readonly memo: EvaluationMemo;
@@ -142,6 +145,12 @@ const primitiveBindingValuesByState = new WeakMap<
   Map<string, JavaScriptSemanticValue>
 >();
 
+/** Effect-derived membership is shared by every value query for this state. */
+const captureSensitiveBindingsByState = new WeakMap<
+  JavaScriptSemanticAnalysisState,
+  ReadonlySet<string>
+>();
+
 const primitiveExpressionValuesByState = new WeakMap<
   JavaScriptSemanticAnalysisState,
   WeakMap<t.Node, JavaScriptSemanticValue>
@@ -160,6 +169,7 @@ export const clearSemanticValueCaches = (
   capturedBindingValuesByState.delete(state);
   primitiveExpressionValuesByState.delete(state);
   callerIndependentBindingValuesByState.delete(state);
+  captureSensitiveBindingsByState.delete(state);
 };
 
 const callerIndependentBindingValuesFor = (
@@ -302,6 +312,19 @@ const collectEvaluationDependencies = <T>(
   }
 };
 
+const captureSensitiveBindingsFor = (
+  context: EvaluationContext,
+): ReadonlySet<string> => {
+  const existing = captureSensitiveBindingsByState.get(context.state);
+  if (existing !== undefined) return existing;
+  const bindings = new Set<string>();
+  for (const binding of context.state.bindingsById.values())
+    if (binding.memberWrites.length > 0 || binding.escapedPaths.length > 0)
+      bindings.add(binding.bindingId);
+  captureSensitiveBindingsByState.set(context.state, bindings);
+  return bindings;
+};
+
 /**
  * A value snapshot consumes its sole initializer plus its source binding's
  * effects. Key the parsed initializer fact (including projection), binding ID
@@ -312,19 +335,20 @@ const collectEvaluationDependencies = <T>(
 const readSnapshotValuesFor = (
   binding: JavaScriptSemanticBindingState,
   context: EvaluationContext,
+  capturePoint: t.Node | undefined,
 ): Map<number, ReadSnapshotValue> | undefined => {
   const initializer = binding.initializers[0];
   if (binding.initializers.length !== 1 || initializer === undefined)
     return undefined;
   let values: ReadSnapshotValues;
-  if (context.capturePoint === undefined)
+  if (capturePoint === undefined)
     values = context.memo.snapshotValues ??= new WeakMap();
   else {
     const captures = (context.memo.capturedSnapshotValues ??= new WeakMap());
-    let captured = captures.get(context.capturePoint);
+    let captured = captures.get(capturePoint);
     if (captured === undefined) {
       captured = new WeakMap();
-      captures.set(context.capturePoint, captured);
+      captures.set(capturePoint, captured);
     }
     values = captured;
   }
@@ -333,10 +357,17 @@ const readSnapshotValuesFor = (
     entries = new Map();
     values.set(initializer, entries);
   }
-  let depths = entries.get(binding.bindingId);
+  // The same initializer may have been evaluated without source-order checks.
+  let modes = entries.get(binding.bindingId);
+  if (modes === undefined) {
+    modes = new Map();
+    entries.set(binding.bindingId, modes);
+  }
+  const sourceRead = context.sourceRead === true;
+  let depths = modes.get(sourceRead);
   if (depths === undefined) {
     depths = new Map();
-    entries.set(binding.bindingId, depths);
+    modes.set(sourceRead, depths);
   }
   return depths;
 };
@@ -378,8 +409,18 @@ const evaluateBinding = (
   // more nesting than the remaining depth budget allows it to observe.
   const snapshots = wholeBinding
     ? undefined
-    : readSnapshotValuesFor(binding, context);
-  const snapshot = snapshots?.get(context.expressionDepth);
+    : readSnapshotValuesFor(binding, context, context.capturePoint);
+  // A source-read snapshot with no effectful dependency is also valid at
+  // other capture points. Keep it in this same query-owned snapshot cache.
+  const sharedSnapshots =
+    snapshots !== undefined && context.sourceRead === true
+      ? readSnapshotValuesFor(binding, context, undefined)
+      : undefined;
+  const sharedSnapshot = sharedSnapshots?.get(context.expressionDepth);
+  const snapshot =
+    sharedSnapshot?.captureIndependent === true
+      ? sharedSnapshot
+      : snapshots?.get(context.expressionDepth);
   const snapshotValue = readMemoizedEvaluation(snapshot, context);
   if (snapshotValue !== undefined) {
     // A result limited by this budget must not become caller-independent when
@@ -515,12 +556,22 @@ const evaluateBinding = (
       evaluated.dependencies,
       context.bindings,
     )
-  )
-    snapshots.set(context.expressionDepth, {
+  ) {
+    const snapshot: ReadSnapshotValue = {
       value: projected,
       dependencies: evaluated.dependencies,
       depthDependent,
-    });
+      captureIndependent:
+        context.sourceRead === true &&
+        !context.memo.dependencies.intersects(
+          evaluated.dependencies,
+          captureSensitiveBindingsFor(context),
+        ),
+    };
+    snapshots.set(context.expressionDepth, snapshot);
+    if (snapshot.captureIndependent)
+      sharedSnapshots?.set(context.expressionDepth, snapshot);
+  }
   // Point-local memoization also bounds failed speculative captures. Only a
   // primitive result is allowed back into ordinary value evaluation.
   if (
@@ -574,37 +625,42 @@ const evaluateExpressionValue = (
     if (binding === undefined)
       return { status: "unknown", reason: `Unbound identifier ${node.name}.` };
     const read =
-      binding.mutable &&
-      binding.definitions.some(({ kind }) => kind === "assignment")
+      context.sourceRead === true ||
+      (binding.mutable &&
+        binding.definitions.some(({ kind }) => kind === "assignment"))
         ? semanticBindingAtRead(binding, node, context.state.parentsByNode)
         : undefined;
-    if (read?.status === "unresolved") {
-      const value = evaluateBinding(binding, nestedContext(context));
-      if (
-        value.status === "unknown" ||
-        value.status === "ambiguous" ||
-        value.status === "cycle"
-      )
-        return value;
+    if (
+      read?.status === "unresolved" &&
+      (binding.declarationKinds.has("var") ||
+        binding.definitions.some(({ kind }) => kind === "assignment"))
+    ) {
+      if (context.sourceRead === true)
+        recordBindingDependency(binding, context);
+      else {
+        const value = evaluateBinding(binding, nestedContext(context));
+        if (
+          value.status === "unknown" ||
+          value.status === "ambiguous" ||
+          value.status === "cycle"
+        )
+          return value;
+      }
       return {
         status: "unknown",
         reason: `Binding ${binding.name} has unresolved ordering at this read.`,
       };
     }
     const atRead = read?.binding ?? binding;
-    return evaluateBinding(atRead, nestedContext(context), atRead === binding);
+    return evaluateBinding(
+      atRead,
+      nestedContext(context),
+      context.sourceRead !== true && atRead === binding,
+    );
   }
   if (t.isTemplateLiteral(node)) return evaluateTemplate(node, context);
-  if (t.isConditionalExpression(node))
-    return mergeValues([
-      evaluateExpression(node.consequent, nestedContext(context)),
-      evaluateExpression(node.alternate, nestedContext(context)),
-    ]);
-  if (t.isLogicalExpression(node))
-    return mergeValues([
-      evaluateExpression(node.left, nestedContext(context)),
-      evaluateExpression(node.right, nestedContext(context)),
-    ]);
+  if (t.isConditionalExpression(node) || t.isLogicalExpression(node))
+    return evaluateBranches(node, context);
   if (t.isObjectExpression(node)) return evaluateObject(node, context);
   if (t.isArrayExpression(node)) return evaluateArray(node, context);
   if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node))
@@ -613,6 +669,56 @@ const evaluateExpressionValue = (
     return evaluateAddition(node, context);
   if (t.isUnaryExpression(node)) return evaluateUnary(node, context);
   return { status: "unknown", reason: `Unsupported ${node.type} value.` };
+};
+
+const evaluateBranches = (
+  node: t.ConditionalExpression | t.LogicalExpression,
+  parent: EvaluationContext,
+): JavaScriptSemanticValue => {
+  const context: EvaluationContext = { ...parent, sourceRead: true };
+  if (t.isLogicalExpression(node)) return evaluateLogical(node, context);
+  const test = primitiveCandidates(
+    evaluateExpression(node.test, nestedContext(context)),
+  );
+  if (test !== null && test.length > 0) {
+    const truth = Boolean(test[0]);
+    if (test.every((value) => Boolean(value) === truth))
+      return evaluateExpression(
+        truth ? node.consequent : node.alternate,
+        nestedContext(context),
+      );
+  }
+  return mergeValues([
+    evaluateExpression(node.consequent, nestedContext(context)),
+    evaluateExpression(node.alternate, nestedContext(context)),
+  ]);
+};
+
+const evaluateLogical = (
+  node: t.LogicalExpression,
+  context: EvaluationContext,
+): JavaScriptSemanticValue => {
+  const left = evaluateExpression(node.left, nestedContext(context));
+  const candidates = primitiveCandidates(left);
+  if (candidates === null || candidates.length === 0)
+    return mergeValues([
+      left,
+      evaluateExpression(node.right, nestedContext(context)),
+    ]);
+  // Retain only left candidates returned by the operator. The others reach
+  // the right operand, whose value replaces them rather than joining them.
+  const retained = candidates.filter((value) =>
+    node.operator === "??"
+      ? value !== null
+      : node.operator === "||"
+        ? Boolean(value)
+        : !value,
+  );
+  if (retained.length === candidates.length) return left;
+  const right = evaluateExpression(node.right, nestedContext(context));
+  return retained.length === 0
+    ? right
+    : mergeValues([primitiveSet(retained), right]);
 };
 
 const evaluateTemplate = (
@@ -1183,6 +1289,7 @@ const nestedContext = (context: EvaluationContext): EvaluationContext => ({
   bindings: context.bindings,
   dependence: context.dependence,
   memo: context.memo,
+  ...(context.sourceRead === true ? { sourceRead: true } : {}),
 });
 
 const isPrimitive = (value: JavaScriptSemanticValue): boolean =>
@@ -1208,7 +1315,8 @@ const captureContextAt = (
   context: EvaluationContext,
 ): EvaluationContext | undefined => {
   if (
-    context.capturePoint !== undefined ||
+    context.capturePoint === node ||
+    (context.sourceRead !== true && context.capturePoint !== undefined) ||
     semanticCapturePosition(node, context.state.parentsByNode) === null
   )
     return undefined;
@@ -1232,7 +1340,7 @@ const evaluateCapturedExpression = (
   // A literal field captures its primitive at construction, even when its
   // containing object is subsequently read at another capture point.
   let values = primitiveExpressionValuesByState.get(context.state);
-  const cached = values?.get(node);
+  const cached = context.sourceRead === true ? undefined : values?.get(node);
   if (cached !== undefined) return cached;
   let value = evaluateExpression(node, context);
   if (canCapturePrimitive(value)) {
@@ -1244,7 +1352,11 @@ const evaluateCapturedExpression = (
   }
   // Never publish values evaluated at somebody else's capture point. Like
   // binding caches, these entries are discarded whenever effects change.
-  if (context.capturePoint === undefined && isPrimitive(value)) {
+  if (
+    context.sourceRead !== true &&
+    context.capturePoint === undefined &&
+    isPrimitive(value)
+  ) {
     if (values === undefined) {
       values = new WeakMap();
       primitiveExpressionValuesByState.set(context.state, values);

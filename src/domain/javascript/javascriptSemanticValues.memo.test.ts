@@ -5,6 +5,7 @@ import {
   indexJavaScriptBindingsSteps,
 } from "./javascriptSemanticAnalysis.js";
 import { SemanticDependencyProofs } from "./javascriptSemanticDependencies.js";
+import { collectSemanticMemberMutationsSteps } from "./javascriptSemanticMemberMutations.js";
 import { SEMANTIC_EXPRESSION_DEPTH_LIMIT } from "./javascriptSemanticResourceLimits.js";
 import type { JavaScriptSemanticValue } from "./javascriptSemanticValueTypes.js";
 import {
@@ -25,48 +26,63 @@ const property = (
   return result;
 };
 
-it("reuses dependency-aware read snapshots across a reconvergent value chain", () => {
-  const measure = (depth: number) => {
-    const source = `let a0=1;${Array.from(
-      { length: depth },
-      (_, index) => `let a${index + 1}=a${index}+a${index};`,
-    ).join(
-      "",
-    )}const saved=a${depth};${Array.from({ length: depth + 1 }, (_, index) => `a${index}=0;`).join("")}`;
-    const parsed = parseJavaScriptSource(source, "saved-chain.js");
+it("indexes capture-sensitive bindings once across independent binding queries", () => {
+  const measure = (width: number) => {
+    const parsed = parseJavaScriptSource(
+      Array.from(
+        { length: width },
+        (_, index) =>
+          `const x${index}=${index + 1}; const y${index}=true ? x${index} : 0;`,
+      ).join("\n"),
+      "independent-branches.js",
+    );
     if (parsed === null) throw new Error("Expected parsed source");
     const steps = indexJavaScriptBindingsSteps(parsed.program);
     let step = steps.next();
     while (step.done !== true) step = steps.next();
     const state = step.value;
-    const saved = [...state.bindingsById.values()].find(
-      ({ name }) => name === "saved",
+    const bindings = [...state.bindingsById.values()].filter(({ name }) =>
+      name.startsWith("y"),
     );
-    if (saved === undefined) throw new Error("Missing saved binding");
-    const binding = vi.spyOn(SemanticDependencyProofs.prototype, "binding");
-    try {
-      expect(evaluateSemanticBinding(saved, state)).toEqual({
-        status: "literal",
-        value: 2 ** depth,
+    const values = state.bindingsById.values.bind(state.bindingsById);
+    let visits = 0;
+    const scan = vi
+      .spyOn(state.bindingsById, "values")
+      .mockImplementation(function* () {
+        for (const binding of values()) {
+          visits++;
+          yield binding;
+        }
+        return undefined;
       });
-      return binding.mock.calls.length;
+    try {
+      for (const [index, binding] of bindings.entries())
+        expect(evaluateSemanticBinding(binding, state)).toEqual({
+          status: "literal",
+          value: index + 1,
+        });
+      return visits;
     } finally {
-      binding.mockRestore();
+      scan.mockRestore();
     }
   };
-  const small = measure(8);
-  const large = measure(12);
+  const small = measure(32);
+  const large = measure(64);
   expect(small).toBeGreaterThan(0);
   expect(large).toBeLessThan(3 * small);
 });
 
-it("preserves the remaining depth budget when reusing a read snapshot", () => {
-  const depth = 12;
-  const nesting = SEMANTIC_EXPRESSION_DEPTH_LIMIT - depth;
-  const source = `let a0=1;${Array.from({ length: depth }, (_, index) => `let a${index + 1}=a${index}+a${index};`).join("")}
-const root={shallow:a${depth},deep:${"[".repeat(nesting)}a${depth}${"]".repeat(nesting)},after:a${depth}};
-${Array.from({ length: depth + 1 }, (_, index) => `a${index}=0;`).join("")}`;
-  const parsed = parseJavaScriptSource(source, "snapshot-depth.js");
+it("refreshes capture sensitivity when the effect producer invalidates values", () => {
+  const parsed = parseJavaScriptSource(
+    `
+    const source = { value: 1 };
+    const first = true ? source.value : 0;
+    mutate(source);
+    const second = true ? source.value : 0;
+    const root = { first, second };
+  `,
+    "capture-effect-invalidation.js",
+  );
   if (parsed === null) throw new Error("Expected parsed source");
   const steps = indexJavaScriptBindingsSteps(parsed.program);
   let step = steps.next();
@@ -76,23 +92,122 @@ ${Array.from({ length: depth + 1 }, (_, index) => `a${index}=0;`).join("")}`;
     ({ name }) => name === "root",
   );
   if (root === undefined) throw new Error("Missing root binding");
-  const result = evaluateSemanticBinding(root, state);
-  for (const key of ["shallow", "after"])
-    expect(property(result, key)).toEqual({
-      status: "literal",
-      value: 2 ** depth,
-    });
-  let leaf = property(result, "deep");
-  while (leaf.status === "array") {
-    const item = leaf.items[0];
-    if (item === undefined) throw new Error("Missing nested item");
-    leaf = item.value;
-  }
-  expect(leaf).toMatchObject({
-    status: "unknown",
-    resourceLimit: "expression-depth",
-  });
+  const before = evaluateSemanticBinding(root, state);
+  expect(property(before, "second")).toEqual({ status: "literal", value: 1 });
+  const effects = collectSemanticMemberMutationsSteps(parsed.program, state);
+  let effect = effects.next();
+  while (effect.done !== true) effect = effects.next();
+  const after = evaluateSemanticBinding(root, state);
+  expect(property(after, "first")).toEqual({ status: "literal", value: 1 });
+  expect(property(after, "second").status).toBe("unknown");
 });
+
+it.each([
+  "unchecked: +saved, checked: true ? saved : 0",
+  "checked: true ? saved : 0, unchecked: +saved",
+])(
+  "does not let an ordinary snapshot establish a future branch operand: %s",
+  (fields) => {
+    const parsed = parseJavaScriptSource(
+      `
+    let alias = enabled;
+    const saved = alias;
+    alias = 0;
+    var enabled = 1;
+    const root = { ${fields} };
+  `,
+      "mixed-read-modes.js",
+    );
+    if (parsed === null) throw new Error("Expected parsed source");
+    const steps = indexJavaScriptBindingsSteps(parsed.program);
+    let step = steps.next();
+    while (step.done !== true) step = steps.next();
+    const state = step.value;
+    const root = [...state.bindingsById.values()].find(
+      ({ name }) => name === "root",
+    );
+    if (root === undefined) throw new Error("Missing root binding");
+    expect(
+      property(evaluateSemanticBinding(root, state), "checked").status,
+    ).toBe("unknown");
+  },
+);
+
+it.each(["VALUE", "true ? (VALUE) : 0", "false || (VALUE)"])(
+  "reuses dependency-aware read snapshots across a reconvergent value chain: %s",
+  (expression) => {
+    const measure = (depth: number) => {
+      const source = `let a0=1;${Array.from(
+        { length: depth },
+        (_, index) =>
+          `let a${index + 1}=${expression.replace("VALUE", `a${index}+a${index}`)};`,
+      ).join(
+        "",
+      )}const saved=a${depth};${Array.from({ length: depth + 1 }, (_, index) => `a${index}=0;`).join("")}`;
+      const parsed = parseJavaScriptSource(source, "saved-chain.js");
+      if (parsed === null) throw new Error("Expected parsed source");
+      const steps = indexJavaScriptBindingsSteps(parsed.program);
+      let step = steps.next();
+      while (step.done !== true) step = steps.next();
+      const state = step.value;
+      const saved = [...state.bindingsById.values()].find(
+        ({ name }) => name === "saved",
+      );
+      if (saved === undefined) throw new Error("Missing saved binding");
+      const binding = vi.spyOn(SemanticDependencyProofs.prototype, "binding");
+      try {
+        expect(evaluateSemanticBinding(saved, state)).toEqual({
+          status: "literal",
+          value: 2 ** depth,
+        });
+        return binding.mock.calls.length;
+      } finally {
+        binding.mockRestore();
+      }
+    };
+    const small = measure(8);
+    const large = measure(12);
+    expect(small).toBeGreaterThan(0);
+    expect(large).toBeLessThan(3 * small);
+  },
+);
+
+it.each(["VALUE", "true ? VALUE : 0", "false || VALUE"])(
+  "preserves the remaining depth budget when reusing a read snapshot: %s",
+  (expression) => {
+    const depth = 12;
+    const nesting = SEMANTIC_EXPRESSION_DEPTH_LIMIT - depth;
+    const source = `let a0=1;${Array.from({ length: depth }, (_, index) => `let a${index + 1}=a${index}+a${index};`).join("")}
+const root={shallow:${expression.replace("VALUE", `a${depth}`)},deep:${"[".repeat(nesting)}${expression.replace("VALUE", `a${depth}`)}${"]".repeat(nesting)},after:${expression.replace("VALUE", `a${depth}`)}};
+${Array.from({ length: depth + 1 }, (_, index) => `a${index}=0;`).join("")}`;
+    const parsed = parseJavaScriptSource(source, "snapshot-depth.js");
+    if (parsed === null) throw new Error("Expected parsed source");
+    const steps = indexJavaScriptBindingsSteps(parsed.program);
+    let step = steps.next();
+    while (step.done !== true) step = steps.next();
+    const state = step.value;
+    const root = [...state.bindingsById.values()].find(
+      ({ name }) => name === "root",
+    );
+    if (root === undefined) throw new Error("Missing root binding");
+    const result = evaluateSemanticBinding(root, state);
+    for (const key of ["shallow", "after"])
+      expect(property(result, key)).toEqual({
+        status: "literal",
+        value: 2 ** depth,
+      });
+    let leaf = property(result, "deep");
+    while (leaf.status === "array") {
+      const item = leaf.items[0];
+      if (item === undefined) throw new Error("Missing nested item");
+      leaf = item.value;
+    }
+    expect(leaf).toMatchObject({
+      status: "unknown",
+      resourceLimit: "expression-depth",
+    });
+  },
+);
 
 it("bounds reconvergent read work when the expression depth budget is exhausted", () => {
   const depth = SEMANTIC_EXPRESSION_DEPTH_LIMIT;
@@ -263,103 +378,118 @@ const balancedOr = (names: string[]): string => {
   return `(${balancedOr(names.slice(0, middle))} || ${balancedOr(names.slice(middle))})`;
 };
 
-it("shares dependency proofs across a shallow wide reconvergent graph", () => {
-  const measure = (width: number) => {
-    const imports = Array.from({ length: width }, (_, index) => `l${index}`);
-    const aliases = Array.from({ length: width }, (_, index) => `a${index}`);
-    const source = `${imports.map((name) => `import * as ${name} from "fs";`).join("\n")}
+it.each([false, true])(
+  "shares dependency proofs across a shallow wide reconvergent graph (unrelated escape: %s)",
+  (unrelatedEscape) => {
+    const measure = (width: number) => {
+      const imports = Array.from({ length: width }, (_, index) => `l${index}`);
+      const aliases = Array.from({ length: width }, (_, index) => `a${index}`);
+      const source = `${imports.map((name) => `import * as ${name} from "fs";`).join("\n")}
+${unrelatedEscape ? "const other = {}; mutate(other);" : ""}
 const shared = ${balancedOr(imports)};
 function consumer() {
 ${aliases.map((name) => `const ${name} = shared;`).join("\n")}
 const root = ${balancedOr(aliases)};
 }`;
-    const parsed = parseJavaScriptSource(source, "wide.js");
-    if (parsed === null) throw new Error("Expected parsed source");
-    const steps = indexJavaScriptBindingsSteps(parsed.program);
-    let step = steps.next();
-    while (step.done !== true) step = steps.next();
-    const state = step.value;
-    const rootBinding = [...state.bindingsById.values()].find(
-      ({ name }) => name === "root",
-    );
-    if (rootBinding === undefined) throw new Error("Missing root binding");
-    // One root query simultaneously retains every alias memo in this family.
-    // Separate per-binding provenance queries have baseline repeated traversal;
-    // they must not be confused with this cache's retained closure expansion.
-    // Count representation construction and union work, not elapsed time/heap.
-    // Binding-ID additions also discriminate the superseded flattened Sets.
-    let bindingMemberships = 0;
-    let proofBranches = 0;
-    let unionCalls = 0;
-    const add = Set.prototype.add;
-    const freeze = Object.freeze;
-    const union = SemanticDependencyProofs.prototype.union;
-    const addSpy = vi.spyOn(Set.prototype, "add").mockImplementation(function (
-      this: Set<unknown>,
-      value: unknown,
-    ) {
-      if (typeof value === "string" && value.includes("binding:"))
-        bindingMemberships++;
-      return add.call(this, value);
-    });
-    const freezeSpy = vi.spyOn(Object, "freeze").mockImplementation((value) => {
-      if (
-        typeof value === "object" &&
-        value !== null &&
-        Object.hasOwn(value, "zero") &&
-        Object.hasOwn(value, "one") &&
-        Object.keys(value).length === 2
-      )
-        proofBranches++;
-      return freeze(value);
-    });
-    const unionSpy = vi
-      .spyOn(SemanticDependencyProofs.prototype, "union")
-      .mockImplementation(function (
-        this: SemanticDependencyProofs,
-        first,
-        second,
-      ) {
-        unionCalls++;
-        return union.call(this, first, second);
-      });
-    try {
-      expect(evaluateSemanticBinding(rootBinding, state).status).toBe(
-        "ambiguous",
+      const parsed = parseJavaScriptSource(source, "wide.js");
+      if (parsed === null) throw new Error("Expected parsed source");
+      const steps = indexJavaScriptBindingsSteps(parsed.program);
+      let step = steps.next();
+      while (step.done !== true) step = steps.next();
+      const state = step.value;
+      const rootBinding = [...state.bindingsById.values()].find(
+        ({ name }) => name === "root",
       );
-      expect(evaluateSemanticProvenance(rootBinding, state).origins).toEqual([
+      if (rootBinding === undefined) throw new Error("Missing root binding");
+      if (unrelatedEscape) {
+        const effects = collectSemanticMemberMutationsSteps(
+          parsed.program,
+          state,
+        );
+        while (effects.next().done !== true) {
+          /* complete effect indexing */
+        }
+        clearSemanticValueCaches(state);
+      }
+      // One root query simultaneously retains every alias memo in this family.
+      // Separate per-binding provenance queries have baseline repeated traversal;
+      // they must not be confused with this cache's retained closure expansion.
+      // Count representation construction and union work, not elapsed time/heap.
+      // Binding-ID additions also discriminate the superseded flattened Sets.
+      let bindingMemberships = 0;
+      let proofBranches = 0;
+      let unionCalls = 0;
+      const add = Set.prototype.add;
+      const freeze = Object.freeze;
+      const union = SemanticDependencyProofs.prototype.union;
+      const addSpy = vi
+        .spyOn(Set.prototype, "add")
+        .mockImplementation(function (this: Set<unknown>, value: unknown) {
+          if (typeof value === "string" && value.includes("binding:"))
+            bindingMemberships++;
+          return add.call(this, value);
+        });
+      const freezeSpy = vi
+        .spyOn(Object, "freeze")
+        .mockImplementation((value) => {
+          if (
+            typeof value === "object" &&
+            value !== null &&
+            Object.hasOwn(value, "zero") &&
+            Object.hasOwn(value, "one") &&
+            Object.keys(value).length === 2
+          )
+            proofBranches++;
+          return freeze(value);
+        });
+      const unionSpy = vi
+        .spyOn(SemanticDependencyProofs.prototype, "union")
+        .mockImplementation(function (
+          this: SemanticDependencyProofs,
+          first,
+          second,
+        ) {
+          unionCalls++;
+          return union.call(this, first, second);
+        });
+      try {
+        expect(evaluateSemanticBinding(rootBinding, state).status).toBe(
+          "ambiguous",
+        );
+        expect(evaluateSemanticProvenance(rootBinding, state).origins).toEqual([
+          { specifier: "fs", importedPath: [] },
+        ]);
+      } finally {
+        unionSpy.mockRestore();
+        freezeSpy.mockRestore();
+        addSpy.mockRestore();
+      }
+      const result = analyzeJavaScriptSemantics(source);
+      expect(result.coverage).toEqual({ status: "complete", omittedCount: 0 });
+      for (const name of [...imports, ...aliases, "shared", "root"])
+        expect(
+          result.bindings.filter((entry) => entry.name === name),
+        ).toHaveLength(1);
+      const root = result.bindings.find((entry) => entry.name === "root");
+      expect(root?.value.status).toBe("ambiguous");
+      expect(root?.provenance.origins).toEqual([
         { specifier: "fs", importedPath: [] },
       ]);
-    } finally {
-      unionSpy.mockRestore();
-      freezeSpy.mockRestore();
-      addSpy.mockRestore();
-    }
-    const result = analyzeJavaScriptSemantics(source);
-    expect(result.coverage).toEqual({ status: "complete", omittedCount: 0 });
-    for (const name of [...imports, ...aliases, "shared", "root"])
-      expect(
-        result.bindings.filter((entry) => entry.name === name),
-      ).toHaveLength(1);
-    const root = result.bindings.find((entry) => entry.name === "root");
-    expect(root?.value.status).toBe("ambiguous");
-    expect(root?.provenance.origins).toEqual([
-      { specifier: "fs", importedPath: [] },
-    ]);
-    return {
-      storage: bindingMemberships + proofBranches,
-      work: bindingMemberships + unionCalls,
+      return {
+        storage: bindingMemberships + proofBranches,
+        work: bindingMemberships + unionCalls,
+      };
     };
-  };
-  // Balanced depths remain small; doubling both independent widths must not
-  // quadruple proof construction/work while all meaningful aliases survive.
-  const small = measure(32);
-  const large = measure(64);
-  expect(small.storage).toBeGreaterThan(0);
-  expect(small.work).toBeGreaterThan(0);
-  expect(large.storage).toBeLessThan(small.storage * 3);
-  expect(large.work).toBeLessThan(small.work * 3);
-});
+    // Balanced depths remain small; doubling both independent widths must not
+    // quadruple proof construction/work while all meaningful aliases survive.
+    const small = measure(32);
+    const large = measure(64);
+    expect(small.storage).toBeGreaterThan(0);
+    expect(small.work).toBeGreaterThan(0);
+    expect(large.storage).toBeLessThan(small.storage * 3);
+    expect(large.work).toBeLessThan(small.work * 3);
+  },
+);
 
 it("uses immutable exact identity proofs and shares unchanged union branches", () => {
   const proofs = new SemanticDependencyProofs(["a", "b", "c", "d", "e"]);

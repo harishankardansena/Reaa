@@ -9,6 +9,7 @@ import { parseJavaScriptApplicationGraph } from "../../../../src/domain/javascri
 import { compareJavaScriptApplicationVersions } from "../../../../src/domain/javascript/javascriptApplicationVersionComparison.js";
 import { semanticResourceLimitReason } from "../../../../src/domain/javascript/javascriptSemanticResourceLimits.js";
 import { getterExpansionSource } from "../../../fixtures/javascriptGetterExpansion.js";
+import { primitiveCandidateExpansionExpression } from "../../../fixtures/javascriptPrimitiveExpansion.js";
 import { scanCanonicalArtifactInventory } from "../../../fixtures/artifactInventory.js";
 import { readJavaScriptArtifactFiles } from "../../../support/javascriptApplicationScope.js";
 import { createJavaScriptArtifactReader } from "../../../../src/artifacts/javascript/JavaScriptArtifactReader.js";
@@ -39,14 +40,27 @@ const relationshipGraph = async (root: string) => {
 };
 
 it.each([
-  ["getter-expansion", getterExpansionSource()],
-  [
-    "primitive-candidates",
-    `const result = ${Array.from({ length: 20 }, () => '(true ? "a" : "b")').join(" + ")};`,
-  ],
+  {
+    name: "getter-expansion",
+    limit: "getter-expansion",
+    source: getterExpansionSource(),
+    exceeded: true,
+  },
+  {
+    name: "primitive-candidates",
+    limit: "primitive-candidates",
+    source: `const result = ${primitiveCandidateExpansionExpression()};`,
+    exceeded: true,
+  },
+  {
+    name: "known primitive selector",
+    limit: "primitive-candidates",
+    source: `const result = ${primitiveCandidateExpansionExpression("true")};`,
+    exceeded: false,
+  },
 ] as const)(
-  "deduplicates %s limitations on import and export relationships",
-  async (limit, source) => {
+  "preserves $name limitations on import and export relationships",
+  async ({ limit, source, exceeded }) => {
     const root = await createTestTempDirectory("rea-module-limit-evidence-");
     await writeFixtureFiles(root, {
       "entry.js": `import imported from "./dep.js"; ${source} export { result };`,
@@ -69,8 +83,8 @@ it.each([
         evidence.limitations.filter(
           (reason) => reason === semanticResourceLimitReason(limit),
         ),
-      ).toEqual([semanticResourceLimitReason(limit)]);
-      expect(evidence.coverage.status).toBe("partial");
+      ).toEqual(exceeded ? [semanticResourceLimitReason(limit)] : []);
+      if (exceeded) expect(evidence.coverage.status).toBe("partial");
       expect(evidence.limitations).toContain(
         "Static syntax does not prove that this relationship executes at runtime.",
       );

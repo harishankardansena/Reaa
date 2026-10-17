@@ -55,7 +55,7 @@ export class SemanticDependencyProofs {
 
   intersects(
     proof: SemanticDependencyProof,
-    active: ReadonlyMap<string, number>,
+    active: ReadonlyMap<string, number> | ReadonlySet<string>,
   ): boolean {
     for (const binding of active.keys())
       if (this.has(proof, binding)) return true;

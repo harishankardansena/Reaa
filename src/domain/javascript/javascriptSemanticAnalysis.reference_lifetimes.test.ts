@@ -9,6 +9,99 @@ const resultValue = (body: string) =>
     "result",
   ).returnSites[0]?.value;
 
+describe("branch primitive capture timing", () => {
+  it.each([
+    "true ? source.value : 0",
+    "false ? 0 : source.value",
+    "false || source.value",
+    "true && source.value",
+    "null ?? source.value",
+    "source.value || 0",
+    "source.value && 1",
+    "source.value ?? 0",
+  ])(
+    "preserves the primitive captured by %s before a later escape",
+    (expression) => {
+      const body = `const source = { value: 1 }; const snapshot = ${expression}; mutate(source);`;
+      for (const read of [
+        "snapshot",
+        "true ? snapshot : 0",
+        "false || snapshot",
+      ])
+        expect(resultValue(`${body} return ${read};`)).toEqual({
+          status: "literal",
+          value: 1,
+        });
+      expect(
+        resultValue(
+          `const source = { value: 1 }; mutate(source); const snapshot = ${expression}; return snapshot;`,
+        ),
+      ).toMatchObject({
+        status: expect.stringMatching(/^(?:unknown|ambiguous)$/u),
+      });
+    },
+  );
+
+  it("does not reuse earlier captured state for a later operand in the same query", () => {
+    const ir = resultValue(`
+      const source = { value: 1 };
+      const first = true ? source.value : 0;
+      mutate(source);
+      const second = true ? source.value : 0;
+      return true ? { first, second } : {};
+    `);
+    expect(ir).toMatchObject({
+      status: "object",
+      properties: [
+        { name: "first", value: { status: "literal", value: 1 } },
+        { name: "second", value: { status: "unknown" } },
+      ],
+    });
+  });
+
+  it.each(["true ? source.value : 0", "false || source.value"])(
+    "keeps persistent and loop-carried sources uncertain for %s",
+    (expression) => {
+      const persistent = analyzeJavaScriptSemantics(`
+        const source = { value: 1 };
+        export function result() {
+          const snapshot = ${expression}; mutate(source); return snapshot;
+        }
+      `);
+      expect(
+        onlyCallable(persistent, "result").returnSites[0]?.value,
+      ).toMatchObject({
+        status: expect.stringMatching(/^(?:unknown|ambiguous)$/u),
+      });
+      expect(
+        resultValue(`
+        const source = { value: 1 };
+        for (let i = 0; i < 2; i++) {
+          const snapshot = ${expression}; mutate(source);
+          if (i === 1) return snapshot;
+        }
+      `),
+      ).toMatchObject({
+        status: expect.stringMatching(/^(?:unknown|ambiguous)$/u),
+      });
+    },
+  );
+
+  it.each([
+    "true ? source : {}",
+    "false || source",
+    "true && source",
+    "null ?? source",
+  ])("keeps selected object references live for %s", (expression) => {
+    expect(
+      resultValue(`
+        const source = { value: 1 }; const snapshot = ${expression};
+        mutate(source); return snapshot.value;
+      `)?.status,
+    ).toBe("unknown");
+  });
+});
+
 describe("bounded paths through dynamic selectors and class origins", () => {
   it("bounds linked-list walks through class instances", () => {
     const start = performance.now();

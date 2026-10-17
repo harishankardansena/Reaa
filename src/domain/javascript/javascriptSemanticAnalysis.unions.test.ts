@@ -8,6 +8,7 @@ import {
 import { topLevelBinding } from "./javascriptSemanticAnalysis.fixture.js";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
 import { readExactJavaScriptLiteral } from "./javascriptAstValues.js";
+import { primitiveCandidateExpansionExpression } from "../../../tests/fixtures/javascriptPrimitiveExpansion.js";
 
 const conditionalCandidates = [
   '"one"',
@@ -139,6 +140,37 @@ describe("conditional primitive unions", () => {
       ),
     ).toEqual(incompatibleValue);
   });
+
+  it("selects only reachable branches for primitive tests of uniform truthiness", () => {
+    const tests = [
+      ["false", false],
+      ["0", false],
+      ['""', false],
+      ["null", false],
+      ["true", true],
+      ["-1", true],
+      ['"yes"', true],
+      ['(choice ? 1 : "yes")', true],
+      ['(choice ? null : other ? 0 : "")', false],
+    ] as const;
+    expect(
+      valuesOf(
+        tests.map(([test, truth]) =>
+          truth
+            ? `${test} ? "selected" : missing`
+            : `${test} ? missing : "selected"`,
+        ),
+      ),
+    ).toEqual(tests.map(() => ({ status: "literal", value: "selected" })));
+    expect(valueOf('(choice ? "" : "yes") ? "one" : "two"')).toEqual({
+      status: "union",
+      values: ["one", "two"],
+    });
+    expect(valueOf('({}) ? "one" : "two"')).toEqual({
+      status: "union",
+      values: ["one", "two"],
+    });
+  });
 });
 
 describe("logical primitive unions", () => {
@@ -170,52 +202,250 @@ describe("logical primitive unions", () => {
     },
   ];
   const cases = operators.flatMap(({ operator, alternatives }) =>
-    alternatives.flatMap((known) =>
+    alternatives.flatMap((known, index) =>
       ["missing", "unsupported()"].flatMap((other) => [
-        `${known} ${operator} ${other}`,
-        `${other} ${operator} ${known}`,
+        {
+          expression: `${known} ${operator} ${other}`,
+          status: index === 0 ? "unknown" : "ambiguous",
+        },
+        { expression: `${other} ${operator} ${known}`, status: "ambiguous" },
       ]),
     ),
   );
 
   it("preserves unresolved alternatives across logical expressions", () => {
-    expect(valuesOf(cases)).toEqual(cases.map(() => incompatibleValue));
+    expect(valuesOf(cases.map(({ expression }) => expression))).toEqual(
+      cases.map(({ status }) => expect.objectContaining({ status })),
+    );
   });
 
   const exactCases = [
     [
       '(choice ? "" : "one") || "two"',
-      { status: "union", values: ["", "one", "two"] },
+      { status: "union", values: ["one", "two"] },
     ],
-    [
-      '(choice ? 0 : "one") && "two"',
-      { status: "union", values: [0, "one", "two"] },
-    ],
+    ['(choice ? 0 : "one") && "two"', { status: "union", values: [0, "two"] }],
     [
       '(choice ? null : "one") ?? "two"',
-      { status: "union", values: [null, "one", "two"] },
+      { status: "union", values: ["one", "two"] },
     ],
     ['"one" || "one"', { status: "literal", value: "one" }],
     ["null ?? null", { status: "literal", value: null }],
+    [
+      '(choice ? null : false) ?? "two"',
+      { status: "union", values: [false, "two"] },
+    ],
+    ['(choice ? 0 : "") || "two"', { status: "literal", value: "two" }],
+    ['(choice ? 1 : "one") && "two"', { status: "literal", value: "two" }],
+    [
+      '(choice ? false : "") ?? missing',
+      { status: "union", values: [false, ""] },
+    ],
+    [
+      '(choice ? 1 : "one") || missing',
+      { status: "union", values: [1, "one"] },
+    ],
+    ["(choice ? 0 : null) && missing", { status: "union", values: [null, 0] }],
   ] as const;
 
-  it("retains conservative primitive unions across logical expressions", () => {
+  it("retains only returned primitive candidates across logical expressions", () => {
     expect(valuesOf(exactCases.map(([expression]) => expression))).toEqual(
       exactCases.map(([, expected]) => expected),
     );
   });
 
-  const unevaluatedCases = [
-    'true ? "one" : missing',
-    '"one" || missing',
-    "false && missing",
-    '"one" ?? missing',
-  ];
-
-  it("does not introduce short-circuit evaluation", () => {
-    expect(valuesOf(unevaluatedCases)).toEqual(
-      unevaluatedCases.map(() => incompatibleValue),
+  it("skips unresolved operands when a primitive value short-circuits", () => {
+    const cases = [
+      ['true ? "one" : missing', "one"],
+      ['"one" || missing', "one"],
+      ["false && missing", false],
+      ['"one" ?? missing', "one"],
+      ["0 && missing", 0],
+      ["null && missing", null],
+      ['"" && missing', ""],
+      ["false ?? missing", false],
+      ["0 ?? missing", 0],
+      ['"" ?? missing', ""],
+      ['false || "two"', "two"],
+      ['0 || "two"', "two"],
+      ['"" || "two"', "two"],
+      ['null || "two"', "two"],
+      ['true && "two"', "two"],
+      ['null ?? "two"', "two"],
+    ] as const;
+    expect(valuesOf(cases.map(([expression]) => expression))).toEqual(
+      cases.map(([, value]) => ({ status: "literal", value })),
     );
+  });
+
+  it("keeps non-primitive and unrepresentable left operands conservative", () => {
+    const cases = [
+      '({}) || "two"',
+      '[] && "two"',
+      '({}) ?? "two"',
+      'undefined ?? "two"',
+      '-0 || "two"',
+      '1e309 || "two"',
+    ];
+    expect(valuesOf(cases)).toEqual(cases.map(() => incompatibleValue));
+  });
+
+  it("retains selected object and array shapes", () => {
+    for (const expression of [
+      "true ? { key: 1 } : missing",
+      "false || { key: 1 }",
+      "null ?? { key: 1 }",
+    ])
+      expect(valueOf(expression)).toMatchObject({
+        status: "object",
+        properties: [{ name: "key", value: { status: "literal", value: 1 } }],
+      });
+    expect(valueOf("true && [1]")).toMatchObject({
+      status: "array",
+      items: [{ name: "0", value: { status: "literal", value: 1 } }],
+    });
+  });
+
+  it("preserves mutations and escapes through selected object aliases", () => {
+    for (const expression of [
+      "true ? source : {}",
+      "false || source",
+      "null ?? source",
+    ])
+      for (const effect of ["selected.key = 2;", "mutate(selected);"])
+        expect(
+          topLevelBinding(
+            analyzeJavaScriptSemantics(`
+          const source = { key: 1 };
+          const selected = ${expression};
+          ${effect}
+          const answer = source.key;
+        `),
+            "answer",
+          ).value.status,
+        ).toBe("unknown");
+  });
+});
+
+describe("branch selector source reads", () => {
+  it("does not select a later initializer through direct, nested, or cached aliases", () => {
+    for (const source of [
+      'const answer = enabled ? "on" : "off"; var enabled = true;',
+      'const answer = !enabled ? "off" : "on"; var enabled = true;',
+      'const alias = enabled; var enabled = true; const answer = alias ? "on" : "off";',
+      'const alias = enabled; const cached = alias; var enabled = true; const answer = cached ? "on" : "off";',
+      'const answer = settings.enabled ? "on" : "off"; var settings = { enabled: true };',
+      'const answer = enabled ? "on" : "off", enabled = true;',
+      'const answer = enabled ? "on" : "off"; { var enabled = true; }',
+      'const settings = { enabled }; var enabled = true; const answer = settings.enabled ? "on" : "off";',
+    ])
+      expect(
+        topLevelBinding(analyzeJavaScriptSemantics(source), "answer").value,
+      ).toEqual({
+        status: "union",
+        values: ["off", "on"],
+      });
+  });
+
+  it("keeps all logical selectors uncertain before their initializer executes", () => {
+    for (const operator of ["||", "&&", "??"])
+      for (const source of [
+        `const answer = enabled ${operator} "fallback"; var enabled = true;`,
+        `const alias = enabled; var enabled = true; const answer = alias ${operator} "fallback";`,
+      ])
+        expect(
+          topLevelBinding(analyzeJavaScriptSemantics(source), "answer").value
+            .status,
+        ).toBe("ambiguous");
+  });
+
+  it("still folds initialized aliases in selectors and function captures", () => {
+    const ir = analyzeJavaScriptSemantics(`
+      const enabled = true;
+      const alias = enabled;
+      const answer = alias ? "on" : "off";
+      export function captured() { return alias ? "on" : "off"; }
+    `);
+    expect(topLevelBinding(ir, "answer").value).toEqual({
+      status: "literal",
+      value: "on",
+    });
+    expect(
+      ir.callables.find(({ name }) => name === "captured")?.returnSites[0]
+        ?.value,
+    ).toEqual({ status: "literal", value: "on" });
+  });
+
+  it("evaluates selected conditional and logical operands at their source reads", () => {
+    for (const expression of [
+      'true ? enabled : "off"',
+      'false ? "off" : enabled',
+      "false || enabled",
+      "true && enabled",
+      "null ?? enabled",
+      'true ? alias : "off"',
+      'true ? ({ value: enabled }).value : "off"',
+      'true ? [enabled][0] : "off"',
+    ]) {
+      const ir = analyzeJavaScriptSemantics(`
+        const alias = enabled;
+        const answer = ${expression};
+        var enabled = "on";
+      `);
+      expect(topLevelBinding(ir, "answer").value.status, expression).toBe(
+        "unknown",
+      );
+    }
+  });
+
+  it("retains uncertain future operands in merged branch candidates", () => {
+    for (const expression of [
+      'choice ? enabled : "off"',
+      "choice || enabled",
+      "(choice ? 0 : 1) && enabled",
+    ])
+      expect(
+        topLevelBinding(
+          analyzeJavaScriptSemantics(`
+        const answer = ${expression}; var enabled = "on";
+      `),
+          "answer",
+        ).value.status,
+        expression,
+      ).toBe("ambiguous");
+  });
+
+  it("keeps unordered assignment-backed lexical bindings uncertain", () => {
+    for (const source of [
+      'let enabled; const answer = enabled ? "on" : "off"; 0, enabled = true;',
+      'let enabled; const alias = enabled; 0, enabled = true; const answer = alias ? "on" : "off";',
+      'let enabled; if (choice) enabled = true; const answer = enabled ? "on" : "off";',
+    ])
+      expect(
+        topLevelBinding(analyzeJavaScriptSemantics(source), "answer").value,
+      ).toEqual({
+        status: "union",
+        values: ["off", "on"],
+      });
+    for (const operator of ["||", "&&", "??"])
+      expect(
+        topLevelBinding(
+          analyzeJavaScriptSemantics(`
+        let enabled; const answer = enabled ${operator} "fallback"; 0, enabled = true;
+      `),
+          "answer",
+        ).value.status,
+      ).toBe("ambiguous");
+    for (const assignment of ["enabled = true;", "0, enabled = true;"])
+      expect(
+        topLevelBinding(
+          analyzeJavaScriptSemantics(`
+      let enabled; ${assignment}
+      const answer = enabled ? "on" : "off";
+    `),
+          "answer",
+        ).value,
+      ).toEqual({ status: "literal", value: "on" });
   });
 });
 
@@ -334,8 +564,7 @@ describe("semantic primitive allocation and binding reuse", () => {
   );
 
   it("returns an explicit unknown before expanding a large addition product", () => {
-    const term = '(choice ? "a" : "b")';
-    const expression = Array.from({ length: 20 }, () => term).join(" + ");
+    const expression = primitiveCandidateExpansionExpression();
     const value = valueOf(expression);
     expect(value).toMatchObject({
       status: "unknown",
