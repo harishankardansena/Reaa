@@ -38,6 +38,17 @@ const prepareReferenceSourceDirectoryFixture =
       ["bare-index.cjs", "./bare", "bare.js"],
       ["package-main.cjs", "./pkg", "pkg/actual.js"],
       ["package-main-no-index.cjs", "./no-index-pkg", "no-index-pkg/actual.js"],
+      [
+        "package-main-extension.cjs",
+        "./main-extension/",
+        "main-extension/entry.js",
+      ],
+      [
+        "package-main-directory.cjs",
+        "./main-directory",
+        "main-directory/lib/index.js",
+      ],
+      ["file-package.cjs", "./file-package", "file-package.js"],
       ["package-main-fallback.cjs", "./stale", "stale/index.js"],
       ["typed-index-collision.cjs", "./typed", "typed.js"],
       ["package-main-slash.cjs", "./slashed", "slashed/lib.js"],
@@ -55,6 +66,9 @@ const prepareReferenceSourceDirectoryFixture =
       ["only-bare.cjs", "./only/", "only/"],
       ["invalid-manifest.cjs", "./broken", "broken"],
       ["absolute-main.cjs", "./absolute", outside],
+      ["no-index-missing-main.cjs", "./no-index-missing", "no-index-missing"],
+      ["no-index-invalid-main.cjs", "./no-index-invalid", "no-index-invalid"],
+      ["no-index-escape-main.cjs", "./no-index-escape", "../outside/index.js"],
     ] as const satisfies readonly ResolutionCase[];
     const files = new Map<string, string>([
       ["index.js", 'module.exports = "root index";\n'],
@@ -79,6 +93,16 @@ const prepareReferenceSourceDirectoryFixture =
       ],
       ["typed.js", 'module.exports = "runtime file";\n'],
       ["typed/index.ts", 'export const value = "source index";\n'],
+      ["main-extension/package.json", '{"main":"entry"}\n'],
+      ["main-extension/entry.js", 'module.exports = "extension main";\n'],
+      ["main-directory/package.json", '{"main":"lib"}\n'],
+      ["main-directory/lib/index.js", 'module.exports = "directory main";\n'],
+      ["file-package.js", 'module.exports = "file before package";\n'],
+      ["file-package/package.json", '{"main":"entry.js"}\n'],
+      ["file-package/entry.js", 'module.exports = "unused package main";\n'],
+      ["no-index-missing/package.json", '{"main":"absent.js"}\n'],
+      ["no-index-invalid/package.json", '{"main":\n'],
+      ["no-index-escape/package.json", '{"main":"../../outside/index.js"}\n'],
       ["stale/package.json", '{"main":"gone.js"}\n'],
       ["stale/index.js", 'module.exports = "legacy fallback";\n'],
       ["broken/package.json", '{"main":\n'],
@@ -135,6 +159,16 @@ const assertNodeResolutionControls = (
   expect(() =>
     createRequire(join(root, "invalid-manifest.cjs")).resolve("./broken"),
   ).toThrow();
+  for (const [from, specifier] of [
+    ["no-index-missing-main.cjs", "./no-index-missing"],
+    ["no-index-invalid-main.cjs", "./no-index-invalid"],
+  ] as const)
+    expect(() => createRequire(join(root, from)).resolve(specifier)).toThrow();
+  expect(
+    createRequire(join(root, "no-index-escape-main.cjs")).resolve(
+      "./no-index-escape",
+    ),
+  ).toBe(outside);
   expect(createRequire(join(root, "escape.cjs")).resolve("../outside/")).toBe(
     outside,
   );

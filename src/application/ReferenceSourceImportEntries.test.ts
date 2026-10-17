@@ -208,10 +208,13 @@ it("matches package manifests by exact or unique canonical directory identity", 
   const decomposed = "cafe\u0301";
   const composedTwin = "r\u00e9sum\u00e9";
   const decomposedTwin = "re\u0301sume\u0301";
+  const ambiguous = "r\u00e9serv\u00e9";
+  const ambiguousFirst = "re\u0301serv\u00e9";
+  const ambiguousSecond = "r\u00e9serve\u0301";
   const files = [
     [
       "main.cjs",
-      [composed, composedTwin, decomposedTwin]
+      [composed, composedTwin, decomposedTwin, ambiguous]
         .map((name) => `require(${JSON.stringify(`./${name}`)});`)
         .join("\n"),
     ],
@@ -225,6 +228,10 @@ it("matches package manifests by exact or unique canonical directory identity", 
       `${decomposedTwin}/exact-decomposed.js`,
       'module.exports = "decomposed";\n',
     ],
+    [`${ambiguousFirst}/package.json`, '{"main":"first.js"}\n'],
+    [`${ambiguousFirst}/first.js`, 'module.exports = "first";\n'],
+    [`${ambiguousSecond}/package.json`, '{"main":"second.js"}\n'],
+    [`${ambiguousSecond}/second.js`, 'module.exports = "second";\n'],
   ] as const;
   const read: ReferenceSourceRead = {
     root: "/selected/source",
@@ -247,12 +254,70 @@ it("matches package manifests by exact or unique canonical directory identity", 
     new Set(files.map(([path]) => path)),
   );
 
-  expect(parsed.relationships.map(({ to }) => to)).toEqual([
-    `${decomposed}/unique.js`,
-    `${composedTwin}/exact-composed.js`,
-    `${decomposedTwin}/exact-decomposed.js`,
+  expect(
+    parsed.relationships.map(({ to, resolution }) => ({ to, resolution })),
+  ).toEqual([
+    { to: `${decomposed}/unique.js`, resolution: "internal" },
+    { to: `${composedTwin}/exact-composed.js`, resolution: "internal" },
+    { to: `${decomposedTwin}/exact-decomposed.js`, resolution: "internal" },
+    { to: ambiguous, resolution: "unresolved" },
   ]);
 });
+
+it.each([
+  ["exact unreadable", "r\u00e9sum\u00e9", "re\u0301sume\u0301"],
+  ["ambiguous observed", "re\u0301sum\u00e9", "r\u00e9sume\u0301"],
+] as const)(
+  "keeps an %s manifest identity unknown",
+  (_name, unreadable, readable) => {
+    const files = new Map([
+      ["main.cjs", 'require("./r\u00e9sum\u00e9");'],
+      [`${readable}/package.json`, '{"main":"entry.js"}'],
+      [`${readable}/entry.js`, "module.exports = 1;"],
+    ]);
+    const read: ReferenceSourceRead = {
+      root: "/selected/source",
+      entries: [
+        ...[...files].map(([path, content]) => ({
+          status: "read" as const,
+          kind: "file" as const,
+          path,
+          bytes: Buffer.from(content),
+          size: Buffer.byteLength(content),
+        })),
+        {
+          status: "failed",
+          kind: "file",
+          path: `${unreadable}/package.json`,
+          code: "io",
+          message: "Manifest could not be read",
+        },
+      ],
+      bytesRead: [...files.values()].reduce(
+        (sum, content) => sum + Buffer.byteLength(content),
+        0,
+      ),
+      limitations: [],
+    };
+    const parsed = parseReferenceSourceEntries(read, new Set(files.keys()));
+    expect(parsed.relationships).toEqual([
+      {
+        from_path: "main.cjs",
+        to: "r\u00e9sum\u00e9",
+        kind: "requires",
+        resolution: "unresolved",
+        parse_state: "parsed",
+      },
+    ]);
+    expect(parsed.entries).toContainEqual(
+      expect.objectContaining({
+        path: `${unreadable}/package.json`,
+        content_state: "unreadable",
+        sha256: null,
+      }),
+    );
+  },
+);
 
 it("resolves extensionless imports and requires to .mts and .cts files and directory indexes", () => {
   const files = [
