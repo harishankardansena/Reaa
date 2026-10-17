@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   parseAmStartOutput,
+  parseDumpsysPackageOutput,
   parseWmDensityOutput,
   parseWindowFocusOutput,
 } from "./AdbShellOutput.js";
@@ -146,6 +147,60 @@ describe("parseAmStartOutput", () => {
       status: "refused",
       startedActivity: null,
       reportedStatus: "ok",
+    });
+  });
+});
+
+describe("parseDumpsysPackageOutput", () => {
+  it("reports requestedPermissions as null when package details are unavailable (pkg=null)", () => {
+    const output = [
+      "Packages:",
+      "  Package [com.example] (abcdef):",
+      "    appId=10234",
+      "    pkg=null",
+      "    codePath=/data/app/com.example",
+      "    versionCode=45",
+      "    pkgFlags=[ HAS_CODE ]",
+      "    User 0: installed=true",
+    ].join("\n");
+    expect(parseDumpsysPackageOutput(output)).toMatchObject({
+      versionCode: "45",
+      versionName: null,
+      requestedPermissions: null,
+      pkgFlags: "[ HAS_CODE ]",
+    });
+  });
+
+  it("reports requestedPermissions as 0 for a loaded package with an empty requested permissions section", () => {
+    const output = [
+      "Packages:",
+      "  Package [com.example] (abcdef):",
+      "    pkg=Package{abcdef com.example}",
+      "    versionCode=45 minSdk=24 targetSdk=34",
+      "    versionName=1.2.3",
+    ].join("\n");
+    expect(parseDumpsysPackageOutput(output)).toMatchObject({
+      versionCode: "45",
+      versionName: "1.2.3",
+      requestedPermissions: 0,
+    });
+  });
+
+  it("counts requested permissions when present in dumpsys output", () => {
+    const output = [
+      "Packages:",
+      "  Package [com.example] (abcdef):",
+      "    pkg=Package{abcdef com.example}",
+      "    versionCode=45 minSdk=24 targetSdk=34",
+      "    versionName=1.2.3",
+      "    requested permissions:",
+      "      android.permission.INTERNET",
+      "      android.permission.ACCESS_NETWORK_STATE",
+    ].join("\n");
+    expect(parseDumpsysPackageOutput(output)).toMatchObject({
+      versionCode: "45",
+      versionName: "1.2.3",
+      requestedPermissions: 2,
     });
   });
 });

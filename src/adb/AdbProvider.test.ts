@@ -740,6 +740,36 @@ it("projects package details from dumpsys package output", async () => {
   });
 });
 
+it("reports requested_permissions_count as null and coverage as partial when pkg=null", async () => {
+  const { binary } = await writeAdbStub(
+    shellStub({
+      "dumpsys:package": `Packages:
+  Package [com.example] (abcdef):
+    appId=10234
+    pkg=null
+    codePath=/data/app/com.example
+    versionCode=45
+    pkgFlags=[ HAS_CODE ]
+    User 0: installed=true
+`,
+    }),
+  );
+  const provider = providerOver(binary);
+  const result = await provider.execute({
+    operation: "inspect_adb_package",
+    input: { serial: "emulator-5554", package: "com.example" },
+  });
+  if (!result.ok) throw new Error(result.error.message);
+  expect(result.value.result).toMatchObject({
+    version_code: "45",
+    requested_permissions_count: null,
+    coverage: "partial",
+  });
+  expect(result.value.limitations).toContain(
+    "Package details are unavailable on device; requested_permissions_count is unknown",
+  );
+});
+
 // PackageInfo.getLongVersionCode() combines versionCodeMajor and versionCode
 // into a signed 64-bit long, which JSON numbers cannot hold exactly.
 it.each(["9007199254740993", "-4294967296"])(

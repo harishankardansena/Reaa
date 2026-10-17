@@ -249,10 +249,13 @@ export const parseDumpsysPackageOutput = (
     pkgFlags: null,
   };
   let inPermissions = false;
+  let seenPermissionsSection = false;
   let permissions = 0;
+  let parsedPackageUnavailable = false;
   for (const line of stdout.split(/\r?\n/u)) {
     if (line.trim().startsWith("requested permissions:")) {
       inPermissions = true;
+      seenPermissionsSection = true;
       continue;
     }
     // Android 10 and 11 mark restricted entries as "NAME: restricted=true".
@@ -264,11 +267,13 @@ export const parseDumpsysPackageOutput = (
       continue;
     }
     inPermissions = false;
+    if (line.trim() === "pkg=null") parsedPackageUnavailable = true;
     const match = DETAIL_LINE.exec(line);
     if (match === null) continue;
     const key = match[1]!;
     const value = match[2]!.trim();
-    if (key === "versionName" && details.versionName === null)
+    if (key === "pkg" && value === "null") parsedPackageUnavailable = true;
+    else if (key === "versionName" && details.versionName === null)
       details.versionName = value === "" ? null : value;
     else if (key === "versionCode" && details.versionCode === null) {
       const parsed = /^(-?\d+)/u.exec(value);
@@ -288,7 +293,11 @@ export const parseDumpsysPackageOutput = (
     } else if (key === "pkgFlags" && details.pkgFlags === null)
       details.pkgFlags = value === "" ? null : value;
   }
-  return { ...details, requestedPermissions: permissions };
+  return {
+    ...details,
+    requestedPermissions:
+      parsedPackageUnavailable && !seenPermissionsSection ? null : permissions,
+  };
 };
 
 /**

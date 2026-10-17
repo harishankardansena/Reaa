@@ -1539,13 +1539,21 @@ export class AdbProvider {
               coverage:
                 details.versionCode === null && details.versionName === null
                   ? "partial"
-                  : "complete",
+                  : details.requestedPermissions === null
+                    ? "partial"
+                    : "complete",
             },
             provider,
             {
               limitations: [
                 "Fields are a fixed projection of dumpsys package output; version-dependent sections are ignored rather than guessed",
-                "requested_permissions_count counts the listed requested permissions section only",
+                ...(details.requestedPermissions === null
+                  ? [
+                      "Package details are unavailable on device; requested_permissions_count is unknown",
+                    ]
+                  : [
+                      "requested_permissions_count counts the listed requested permissions section only",
+                    ]),
               ],
             },
           ),
